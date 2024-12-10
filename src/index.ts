@@ -8,7 +8,7 @@ export default {
 	},
 	async queue(batch, env): Promise<void> {
 		let messages = JSON.stringify(batch.messages);
-		console.log(`consumed from our queue: ${messages}`);
+		console.debug(`consumed from our queue: ${messages}`);
 		const message = batch.messages[0];
 		const { key } = message.body as { key: string };
 		const file = await downloadLargeFile({ key, env });
@@ -25,7 +25,7 @@ interface DownloadOptions {
 async function downloadLargeFile({
 	key,
 	env,
-}: DownloadOptions): Promise<Blob> {
+}: DownloadOptions): Promise<ReadableStream> {
 	const aws = new AwsClient({
 		service: 's3',
 		accessKeyId: env.SRC_AWS_ACCESS_KEY_ID,
@@ -41,14 +41,12 @@ async function downloadLargeFile({
 		throw new Error(`下载失败: ${await response.text()}`);
 	}
 	console.debug(`${key} 下载成功`);
-	return await response.blob();
+	return response.body!;
 }
 
 interface UploadOptions {
 	key: string;
-	file: File | Blob;
-	chunkSize?: number;
-	onProgress?: (progress: number) => void;
+	file: ReadableStream;
 	env: Env;
 }
 
@@ -60,8 +58,6 @@ interface UploadPart {
 async function uploadLargeFile({
 	key,
 	file,
-	chunkSize = 10 * 1024 * 1024,
-	onProgress,
 	env,
 }: UploadOptions): Promise<void> {
 	const aws = new AwsClient({
@@ -90,19 +86,21 @@ async function uploadLargeFile({
 	}
 
 	const parts: UploadPart[] = [];
-	const totalChunks: number = Math.ceil(file.size / chunkSize);
+	let partNumber = 1;
 
 	try {
-		// 上传分片
-		for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
-			const start: number = (partNumber - 1) * chunkSize;
-			const end: number = Math.min(start + chunkSize, file.size);
-			const chunk: Blob = file.slice(start, end);
+		// 使用 ReadableStream 处理分片上传
+		const reader = file.getReader();
+		let offset = 0;
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
 
 			const uploadUrl: string = `${endpoint}/${env.BUCKET_NAME}/${key}?partNumber=${partNumber}&uploadId=${uploadId}`;
 			const uploadResponse: Response = await aws.fetch(uploadUrl, {
 				method: 'PUT',
-				body: chunk,
+				body: value,
 			});
 
 			if (!uploadResponse.ok) {
@@ -120,9 +118,8 @@ async function uploadLargeFile({
 				PartNumber: partNumber,
 			});
 
-			if (onProgress) {
-				onProgress((partNumber / totalChunks) * 100);
-			}
+			partNumber++;
+			offset += value.length;
 		}
 
 		// 完成分片上传
@@ -146,6 +143,7 @@ async function uploadLargeFile({
 			throw new Error(`完成上传失败: ${await completeResponse.text()}`);
 		}
 
+		console.debug(`${key} 上传成功`);
 	} catch (error) {
 		// 发生错误时尝试中止上传
 		await aws.fetch(`${endpoint}/${env.BUCKET_NAME}/${key}?uploadId=${uploadId}`, {
