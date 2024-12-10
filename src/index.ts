@@ -45,9 +45,9 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 
 		const uploadId = await step.do('Init upload', {
 			retries: {
-				limit: 5,
+				limit: 23,
 				delay: '10 second',
-				backoff: 'constant',
+				backoff: 'exponential',
 			},
 			timeout: '1 minute'
 		}, async () => {
@@ -67,9 +67,9 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 				`Upload file parts ${partNumber}`,
 				{
 					retries: {
-						limit: 5,
+						limit: 23,
 						delay: '30 second',
-						backoff: 'constant',
+						backoff: 'exponential',
 					},
 					timeout: '1 hour'
 				},
@@ -98,18 +98,18 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 		}
 
 		const reader = file.getReader();
-		const bufferSize = 20 * 1024 * 1024; // 20MB
+		const bufferSize = 30 * 1024 * 1024; // 30MB
 		let buffer = new Uint8Array(bufferSize);
 		let bufferOffset = 0;
 		let partNumber = 1;
-		const promises: Promise<{
+		const parts: {
 			ETag: string;
 			PartNumber: number;
-		}>[] = [];
+		}[] = [];
 
 		try {
 			while (true) {
-				const { done, value } = await reader.read();
+				let { done, value } = await reader.read();
 				if (done) break;
 
 				let valueOffset = 0;
@@ -122,32 +122,26 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 					valueOffset += bytesToCopy;
 
 					if (bufferOffset === bufferSize) {
-						promises.push(uploadStep(buffer, partNumber));
+						parts.push(await uploadStep(buffer, partNumber));
 						partNumber++;
 						bufferOffset = 0;
 					}
 				}
+				value = null; // 释放内存
 			}
 
 			// 上传剩余的缓冲区内容
 			if (bufferOffset > 0) {
-				promises.push(uploadStep(buffer.subarray(0, bufferOffset), partNumber));
+				parts.push(await uploadStep(buffer.subarray(0, bufferOffset), partNumber));
 			}
-
-			const parts = (await Promise.allSettled(promises)).map(result => {
-				if (result.status === 'fulfilled') {
-					return result.value;
-				}
-				throw new Error(`Upload part failed: ${result.reason}`);
-			});
 
 			await step.do('Complete upload', {
 				retries: {
-					limit: 5,
-					delay: '10 second',
-					backoff: 'constant',
+					limit: 23,
+					delay: '30 second',
+					backoff: 'exponential',
 				},
-				timeout: '1 minute'
+				timeout: '1 year'
 			}, async () => {
 				// 完成分片上传
 				const completeXml: string = `
