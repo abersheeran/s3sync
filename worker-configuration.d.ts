@@ -11,5 +11,5 @@ interface Env {
 	SRC_AWS_ACCESS_KEY_ID: string;
 	SRC_AWS_SECRET_ACCESS_KEY: string;
 	SRC_AWS_REGION: string;
-	Q: Queue;
+	SYNC_WORKFLOW: Workflow<{key: string}>;
 }
