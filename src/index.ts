@@ -88,38 +88,37 @@ async function uploadLargeFile({
 	const parts: UploadPart[] = [];
 	let partNumber = 1;
 
+	const bufferSize = 20 * 1024 * 1024; // 20MB
+	let buffer = new Uint8Array(bufferSize);
+	let bufferOffset = 0;
+
 	try {
-		// 使用 ReadableStream 处理分片上传
 		const reader = file.getReader();
-		let offset = 0;
 
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
 
-			const uploadUrl: string = `${endpoint}/${env.BUCKET_NAME}/${key}?partNumber=${partNumber}&uploadId=${uploadId}`;
-			const uploadResponse: Response = await aws.fetch(uploadUrl, {
-				method: 'PUT',
-				body: value,
-			});
+			let valueOffset = 0;
+			while (valueOffset < value.length) {
+				const spaceLeft = bufferSize - bufferOffset;
+				const bytesToCopy = Math.min(spaceLeft, value.length - valueOffset);
 
-			if (!uploadResponse.ok) {
-				throw new Error(`分片 ${partNumber} 上传失败`);
+				buffer.set(value.subarray(valueOffset, valueOffset + bytesToCopy), bufferOffset);
+				bufferOffset += bytesToCopy;
+				valueOffset += bytesToCopy;
+
+				if (bufferOffset === bufferSize) {
+					await uploadPart(buffer, partNumber);
+					partNumber++;
+					bufferOffset = 0;
+				}
 			}
+		}
 
-			const etag: string | null = uploadResponse.headers.get('ETag');
-			if (!etag) {
-				throw new Error(`分片 ${partNumber} 未返回 ETag`);
-			}
-
-			console.debug(`${key} 分片 ${partNumber} 上传成功: ${etag}`);
-			parts.push({
-				ETag: etag,
-				PartNumber: partNumber,
-			});
-
-			partNumber++;
-			offset += value.length;
+		// 上传剩余的缓冲区内容
+		if (bufferOffset > 0) {
+			await uploadPart(buffer.subarray(0, bufferOffset), partNumber);
 		}
 
 		// 完成分片上传
@@ -151,5 +150,28 @@ async function uploadLargeFile({
 		}).catch((e: Error) => console.error('中止上传失败:', e));
 
 		throw error;
+	}
+
+	async function uploadPart(data: Uint8Array, partNumber: number) {
+		const uploadUrl: string = `${endpoint}/${env.BUCKET_NAME}/${key}?partNumber=${partNumber}&uploadId=${uploadId}`;
+		const uploadResponse: Response = await aws.fetch(uploadUrl, {
+			method: 'PUT',
+			body: data,
+		});
+
+		if (!uploadResponse.ok) {
+			throw new Error(`分片 ${partNumber} 上传失败`);
+		}
+
+		const etag: string | null = uploadResponse.headers.get('ETag');
+		if (!etag) {
+			throw new Error(`分片 ${partNumber} 未返回 ETag`);
+		}
+
+		console.debug(`${key} 分片 ${partNumber} 上传成功: ${etag}`);
+		parts.push({
+			ETag: etag,
+			PartNumber: partNumber,
+		});
 	}
 }
