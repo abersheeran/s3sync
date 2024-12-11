@@ -2,16 +2,7 @@ import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from 'cloudflare:work
 
 import { AwsClient } from 'aws4fetch';
 
-
-interface DownloadOptions {
-	key: string;
-	env: Env;
-}
-
-async function downloadLargeFile({
-	key,
-	env,
-}: DownloadOptions): Promise<ReadableStream> {
+async function getFileSize(key: string, env: Env): Promise<number> {
 	const aws = new AwsClient({
 		service: 's3',
 		accessKeyId: env.SRC_AWS_ACCESS_KEY_ID,
@@ -20,18 +11,69 @@ async function downloadLargeFile({
 	});
 
 	const endpoint: string = `https://${env.SRC_S3_ENDPOINT}`;
+	const file_url = `${endpoint}/${env.SRC_BUCKET_NAME}/${key}`;
 
-	const response: Response = await aws.fetch(`${endpoint}/${env.SRC_BUCKET_NAME}/${key}`);
+	// 发送 HEAD 请求获取文件元数据
+	const response = await aws.fetch(file_url, {
+		method: 'HEAD'
+	});
 
 	if (!response.ok) {
-		throw new Error(`下载失败: ${await response.text()}`);
+		throw new Error(`获取文件大小失败: ${response.statusText}`);
 	}
+
+	const contentLength = response.headers.get('Content-Length');
+	if (!contentLength) {
+		throw new Error('无法获取文件大小信息');
+	}
+
+	return parseInt(contentLength, 10);
+}
+
+async function getFileRange(
+	key: string,
+	start: number,
+	end: number,
+	env: Env
+): Promise<ReadableStream> {
+	const aws = new AwsClient({
+		service: 's3',
+		accessKeyId: env.SRC_AWS_ACCESS_KEY_ID,
+		secretAccessKey: env.SRC_AWS_SECRET_ACCESS_KEY,
+		region: env.SRC_AWS_REGION,
+	});
+
+	const endpoint: string = `https://${env.SRC_S3_ENDPOINT}`;
+	const file_url = `${endpoint}/${env.SRC_BUCKET_NAME}/${key}`;
+
+	// 发送带有 Range 头的请求获取指定范围的数据
+	const response = await aws.fetch(file_url, {
+		method: 'GET',
+		headers: {
+			'Range': `bytes=${start}-${end}`
+		}
+	});
+
+	if (!response.ok && response.status !== 206) {
+		throw new Error(`获取文件范围数据失败: ${response.statusText}`);
+	}
+
 	return response.body!;
 }
 
 export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 	async run(event: WorkflowEvent<{ key: string }>, step: WorkflowStep) {
 		const { key } = event.payload;
+
+		const file_size = await step.do('Get file size', {
+			retries: {
+				limit: 23,
+				delay: '10 second',
+				backoff: 'exponential',
+			},
+			timeout: '1 hour'
+		}, async () => await getFileSize(key, this.env));
+
 		const endpoint: string = `https://${this.env.S3_ENDPOINT}`;
 		const file_url = `${endpoint}/${this.env.BUCKET_NAME}/${key}`;
 		const aws = new AwsClient({
@@ -41,9 +83,7 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 			region: this.env.AWS_REGION,
 		});
 
-		const file = await downloadLargeFile({ key, env: this.env });
-
-		const uploadId = await step.do('Init upload', {
+		const upload_id = await step.do('Init upload', {
 			retries: {
 				limit: 23,
 				delay: '10 second',
@@ -62,7 +102,7 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 			return uploadId;
 		});
 
-		const uploadStep = (value: Uint8Array, partNumber: number) => {
+		const uploadStep = (partNumber: number, start: number, end: number) => {
 			return step.do(
 				`Upload file parts ${partNumber}`,
 				{
@@ -74,17 +114,17 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 					timeout: '1 hour'
 				},
 				async () => {
-					const uploadUrl: string = `${file_url}?partNumber=${partNumber}&uploadId=${uploadId}`;
-					const uploadResponse: Response = await aws.fetch(uploadUrl, {
+					const upload_url: string = `${file_url}?partNumber=${partNumber}&uploadId=${upload_id}`;
+					const upload_response: Response = await aws.fetch(upload_url, {
 						method: 'PUT',
-						body: value,
+						body: await getFileRange(key, start, end, this.env),
 					});
 
-					if (!uploadResponse.ok) {
-						throw new Error(`分片 ${partNumber} 上传失败`);
+					if (!upload_response.ok) {
+						throw new Error(`分片 ${partNumber} 上传失败: ${upload_response.status} ${await upload_response.text()}`);
 					}
 
-					const etag: string | null = uploadResponse.headers.get('ETag');
+					const etag: string | null = upload_response.headers.get('ETag');
 					if (!etag) {
 						throw new Error(`分片 ${partNumber} 未返回 ETag`);
 					}
@@ -97,89 +137,44 @@ export class SyncWorkflow extends WorkflowEntrypoint<Env, { key: string }> {
 			);
 		}
 
-		const reader = file.getReader();
-		const bufferSize = 30 * 1024 * 1024; // 30MB
-		let buffer = new Uint8Array(bufferSize);
-		let bufferOffset = 0;
-		let partNumber = 1;
-		const parts: {
-			ETag: string;
-			PartNumber: number;
-		}[] = [];
+		const part_size = 100 * 1024 * 1024; // maxsize per part
+		const parts: { ETag: string; PartNumber: number }[] = [];
 
-		try {
-			while (true) {
-				let { done, value } = await reader.read();
-				if (done) break;
+		for (let i = 0; i < file_size; i += part_size) {
+			const start = i;
+			const end = Math.min(i + part_size - 1, file_size - 1);
+			parts.push(await uploadStep(i / part_size + 1, start, end));
+		}
 
-				let valueOffset = 0;
-				while (valueOffset < value.length) {
-					const spaceLeft = bufferSize - bufferOffset;
-					const bytesToCopy = Math.min(spaceLeft, value.length - valueOffset);
-
-					buffer.set(value.subarray(valueOffset, valueOffset + bytesToCopy), bufferOffset);
-					bufferOffset += bytesToCopy;
-					valueOffset += bytesToCopy;
-
-					if (bufferOffset === bufferSize) {
-						parts.push(await uploadStep(buffer, partNumber));
-						partNumber++;
-						bufferOffset = 0;
-					}
-				}
-				value = null; // 释放内存
-			}
-
-			// 上传剩余的缓冲区内容
-			if (bufferOffset > 0) {
-				parts.push(await uploadStep(buffer.subarray(0, bufferOffset), partNumber));
-			}
-
-			await step.do('Complete upload', {
-				retries: {
-					limit: 23,
-					delay: '30 second',
-					backoff: 'exponential',
-				},
-				timeout: '1 year'
-			}, async () => {
-				// 完成分片上传
-				const completeXml: string = `
-					<CompleteMultipartUpload>
-						${parts.map(part => `
-							<Part>
+		await step.do('Complete upload', {
+			retries: {
+				limit: 23,
+				delay: '30 second',
+				backoff: 'exponential',
+			},
+			timeout: '1 year'
+		}, async () => {
+			// 完成分片上传
+			const complete_xml: string = `
+				<CompleteMultipartUpload>
+					${parts.filter(part => part !== null).map(part => `
+						<Part>
 							<PartNumber>${part.PartNumber}</PartNumber>
 							<ETag>${part.ETag}</ETag>
-							</Part>
-						`).join('')}
-						</CompleteMultipartUpload>
-					`;
+						</Part>
+					`).join('')}
+					</CompleteMultipartUpload>
+				`;
 
-				const completeResponse: Response = await aws.fetch(`${file_url}?uploadId=${uploadId}`, {
-					method: 'POST',
-					body: completeXml,
-				});
+			const complete_response: Response = await aws.fetch(`${file_url}?uploadId=${upload_id}`, {
+				method: 'POST',
+				body: complete_xml,
+			});
 
-				if (!completeResponse.ok) {
-					throw new Error(`完成上传失败: ${await completeResponse.text()}`);
-				}
-			});
-		} catch (error) {
-			// 发生错误时尝试中止上传
-			await step.do('Abort upload', {
-				retries: {
-					limit: 5,
-					delay: '10 second',
-					backoff: 'constant',
-				},
-				timeout: '1 minute'
-			}, async () => {
-				await aws.fetch(`${file_url}?uploadId=${uploadId}`, {
-					method: 'DELETE',
-				})
-			});
-			throw error;
-		}
+			if (!complete_response.ok) {
+				throw new Error(`完成上传失败: ${complete_response.status} ${await complete_response.text()}`);
+			}
+		});
 	}
 }
 
